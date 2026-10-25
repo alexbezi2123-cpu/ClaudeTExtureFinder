@@ -215,7 +215,7 @@ class LinkParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         for key, value in attrs:
-            if key in ("href", "data-href", "data-url") and value:
+            if key == "href" and value:
                 self.links.append(value)
 
 
@@ -230,45 +230,48 @@ def texturecan_listing_url(args):
     if args.url:
         return args.url
     if args.query:
-        return f"{TEXTURECAN_BASE}/?s={urllib.parse.quote_plus(args.query)}"
+        return f"{TEXTURECAN_BASE}/search/{urllib.parse.quote_plus(args.query)}/"
     if args.category:
         return f"{TEXTURECAN_BASE}/category/{urllib.parse.quote(args.category)}/"
-    return TEXTURECAN_BASE + "/"
+    return f"{TEXTURECAN_BASE}/category/New/"
 
 
 def texturecan_detail_links(listing_url, limit):
+    """Collect /details/<id>/ pages from a search or category listing, following its pages."""
     if "/details/" in listing_url:
         return [listing_url]
-    seen = []
-    for link in page_links(listing_url):
-        if "/details/" in link and TEXTURECAN_HOST in link:
-            link = link.split("#")[0]
-            if link not in seen:
-                seen.append(link)
-    return seen[:limit]
+    # Listings page as /category/Wood/, /category/Wood/2/, ... and /search/wood/2/.
+    base = re.sub(r"/\d+$", "", listing_url.rstrip("/")) + "/"
+    found = []
+    page = 1
+    while len(found) < limit:
+        try:
+            links = page_links(base if page == 1 else f"{base}{page}/")
+        except urllib.error.HTTPError:
+            break
+        new = list(dict.fromkeys(
+            l.split("#")[0] for l in links
+            if "/details/" in l and TEXTURECAN_HOST in l and l.split("#")[0] not in found))
+        if not new:
+            break
+        found.extend(new)
+        page += 1
+    return found[:limit]
 
 
-def texturecan_fetch_zip(detail_url, res):
-    """Follow download links from a detail page until a zip file comes back."""
-    links = page_links(detail_url)
-    candidates = [l for l in links
-                  if TEXTURECAN_HOST in l and ("download" in l.lower() or l.lower().endswith(".zip"))]
-    res_l = res.lower()
-    candidates.sort(key=lambda l: 0 if res_l in l.lower() else 1)
-    for link in candidates:
-        data, final_url = http_get(link)
-        if data[:2] == b"PK":
-            return data, final_url
-        # A download landing page: look one level deeper for the real zip.
-        parser = LinkParser()
-        parser.feed(data.decode("utf-8", "replace"))
-        for inner in parser.links:
-            inner = urllib.parse.urljoin(final_url, inner)
-            if inner.lower().split("?")[0].endswith(".zip") or "download" in inner.lower():
-                inner_data, inner_url = http_get(inner)
-                if inner_data[:2] == b"PK":
-                    return inner_data, inner_url
-    return None, None
+def texturecan_zip_link(detail_url, res):
+    """Return the map zip linked on a detail page for res (e.g. 1K), or the closest one."""
+    zips = [l for l in page_links(detail_url)
+            if TEXTURECAN_HOST in l and l.lower().split("?")[0].endswith(".zip")
+            and "_sbsar_" not in l.lower()]
+    if not zips:
+        return None
+
+    def res_num(link):
+        m = re.search(r"_(\d+)k_", link.lower())
+        return int(m.group(1)) if m else 99
+    target = int(re.sub(r"\D", "", res) or 1)
+    return min(zips, key=lambda l: abs(res_num(l) - target))
 
 
 def texturecan_collect(args):
@@ -276,19 +279,21 @@ def texturecan_collect(args):
     if not details:
         sys.exit("No TextureCan textures found on that page.")
     items = []
-    CACHE_DIR.mkdir(exist_ok=True)
     for n, detail in enumerate(details, 1):
-        slug = detail.rstrip("/").split("/")[-1] or f"texture{n}"
-        folder = f"TextureCan_{slug}"
-        cache = CACHE_DIR / f"texturecan_{slug}_{args.res}.zip"
-        print(f"[{n}/{len(details)}] {detail}")
-        if not cache.exists():
-            data, _ = texturecan_fetch_zip(detail, args.res)
-            if not data:
-                print("    skipped (no zip download found)")
-                continue
-            cache.write_bytes(data)
-        items.append((folder, cache, f"{folder} - {detail} - see TextureCan.com for license"))
+        url = texturecan_zip_link(detail, args.res)
+        if not url:
+            print(f"[{n}/{len(details)}] {detail}: skipped (no zip download found)")
+            continue
+        # Links look like /downloads/concrete_0030/concrete_0030_1k_NdDPhC.zip
+        parts = urllib.parse.urlparse(url).path.rstrip("/").split("/")
+        folder, name = parts[-2], parts[-1]
+        print(f"[{n}/{len(details)}] {folder}: {name}")
+        try:
+            path = cached_download(url, "texturecan_" + name)
+        except urllib.error.HTTPError as e:
+            print(f"    skipped ({e.code} {e.reason})")
+            continue
+        items.append((folder, path, f"{folder} - {detail} - CC0 1.0 (TextureCan.com)"))
     return items
 
 
@@ -300,8 +305,16 @@ def slugify(name):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "pack"
 
 
-def build_pack(pack_name, items, images_only=False, out_dir=PACKS_DIR):
-    """Write out_dir/<slug>.zip with one folder per texture inside a root folder."""
+# Normal map file name markers used by ambientCG (NormalGL) and TextureCan (normal_opengl).
+NORMAL_MARKERS = {"gl": ("normalgl", "normal_opengl"), "dx": ("normaldx", "normal_directx")}
+
+
+def build_pack(pack_name, items, images_only=False, normal="both", out_dir=PACKS_DIR):
+    """Write out_dir/<slug>.zip with one folder per texture inside a root folder.
+
+    normal="gl" or "dx" drops the other normal map convention.
+    """
+    drop = NORMAL_MARKERS.get({"gl": "dx", "dx": "gl"}.get(normal), ())
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{slugify(pack_name)}.zip"
     root = pack_name.strip()
@@ -322,6 +335,8 @@ def build_pack(pack_name, items, images_only=False, out_dir=PACKS_DIR):
                     name = Path(info.filename).name  # flatten, and blocks ../ paths
                     if not name or (images_only and Path(name).suffix.lower() not in IMAGE_EXTS):
                         continue
+                    if any(m in name.lower() for m in drop):
+                        continue
                     pack.writestr(f"{root}/{folder}/{name}", src.read(info))
             credits.append(credit)
             count += 1
@@ -336,7 +351,7 @@ def cmd_pack(args):
     items = collect(args)
     if not items:
         sys.exit("Nothing downloaded, no pack written.")
-    build_pack(args.name, items, images_only=args.images_only)
+    build_pack(args.name, items, images_only=args.images_only, normal=args.normal)
 
 
 # --------------------------------------------------------------------------- #
@@ -367,12 +382,17 @@ def main(argv=None):
     sp.add_argument("--ids", help="ambientCG asset ids, comma separated (overrides search)")
     sp.add_argument("-r", "--res", default="1K", help="resolution: 1K, 2K, 4K, 8K (default 1K)")
     sp.add_argument("-f", "--format", default="JPG", choices=["JPG", "PNG"], help="image format")
+    sp.add_argument("--normal", choices=["both", "gl", "dx"], default="both",
+                    help="normal maps to keep: gl (Blender/Unity/Godot), dx (Unreal), both (default)")
     sp.add_argument("--images-only", action="store_true",
                     help="keep only texture images (drop .mtlx/.usdc/.blend extras)")
     sp.set_defaults(func=cmd_pack)
 
     args = p.parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    except urllib.error.URLError as e:
+        sys.exit(f"Network error: {e.reason} (is the host allowed in this environment?)")
 
 
 if __name__ == "__main__":
